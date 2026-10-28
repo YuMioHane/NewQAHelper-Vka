@@ -46,6 +46,10 @@ from tkinter import ttk, messagebox
 import recap
 import rehand
 import relook
+try:
+    import _sim
+except Exception:
+    _sim = None
 
 # 工作台按钮相对偏移（同窗口内部结构恒定）
 CRAFT_DX = 118        # 自动填入 → 转化
@@ -399,7 +403,9 @@ class SavePoller:
         self.level = 0
         self.hero_xp = 0.0
         self.bestiary = {}
-        self.theory = None            # 理论收益（theory_rows 结果，随存档刷新）
+        self.theory = None            # 理论收益（_sim 仿真结果，随存档刷新）
+        self.calib = self._load_calib()
+        self.cur_act, self.cur_stage = 0, 0
         self.rw_data = ([], {})       # 符文之语（物品清单, 散宝石）
         self.path = ""
         self.mtime = 0.0
@@ -488,7 +494,9 @@ class SavePoller:
         with self.lock:
             self.mtime, self.path = m, path
             self.level, self.hero_xp, self.bestiary = s["level"], s["xp"], s["bestiary"]
-            self.theory = theory_rows(s["heroes"])
+            self.theory = (_sim.sim_table(s["heroes"], calib=self.calib, cur_act=s["act"])
+                           if _sim else None)
+            self.cur_act, self.cur_stage = s["act"], s["stage"]
             self.rw_data = (s["rw_items"], s["rw_gems"])
             prev = self.samples[-1][1] if self.samples else None
             self.samples.append((now, s))
@@ -1029,24 +1037,29 @@ class App:
         self.lbl_eta2 = ttk.Label(tab2, textvariable=self.v_eta, foreground="#0a7")
         self.lbl_eta2.pack(fill="x", **pad)
 
-        theory = ttk.LabelFrame(tab2, text="理论最佳关卡（队伍DPS×关卡表，普攻口径未含技能/走位；经验=队伍合计，实测仅首英雄）")
+        theory = ttk.LabelFrame(tab2, text="理论最佳关卡（战斗仿真：全词缀/天赋/护甲/闪避/格挡/吸收/等级差/怒气；技能循环未逐个建模，用通关校准对齐）")
         theory.pack(fill="x", **pad)
-        tcols = ("tmap", "tlv", "tks", "txp", "tgd", "tsv")
+        tcols = ("tmap", "tvd", "tlv", "tks", "txp", "tgd", "tch", "tsv")
         self.thtree = ttk.Treeview(theory, columns=tcols, show="headings", height=5)
-        for cid, txt, w, anc in (("tmap", "关卡", 120, "w"), ("tlv", "怪Lv", 45, "e"),
-                                 ("tks", "杀/时", 70, "e"), ("txp", "经验/时", 85, "e"),
-                                 ("tgd", "金币/时", 85, "e"), ("tsv", "生存", 70, "e")):
+        for cid, txt, w, anc in (("tmap", "关卡", 118, "w"), ("tvd", "评价", 42, "center"),
+                                 ("tlv", "怪Lv", 40, "e"), ("tks", "杀/时", 62, "e"),
+                                 ("txp", "经验/时", 80, "e"), ("tgd", "金币/时", 80, "e"),
+                                 ("tch", "宝箱/时", 60, "e"), ("tsv", "坦首领", 62, "e")):
             self.thtree.heading(cid, text=txt)
             self.thtree.column(cid, width=w, anchor=anc)
         self.thtree.pack(side="left", fill="both", expand=True, padx=4, pady=4)
         self.thtree.tag_configure("risk", background="#ffdcdc")
+        self.thtree.tag_configure("warn", background="#ffedd0")
         tbtn = ttk.Frame(theory)
         tbtn.pack(side="left", fill="y", padx=4)
         self.sort_theory = "xp"
         ttk.Button(tbtn, text="按经验排", width=9, command=lambda: self._sort_theory("xp")).pack(pady=2)
         ttk.Button(tbtn, text="按金币排", width=9, command=lambda: self._sort_theory("gold")).pack(pady=2)
+        ttk.Button(tbtn, text="通关校准", width=9, command=self.calibrate_stage).pack(pady=2)
+        ttk.Button(tbtn, text="离线收益", width=9, command=self.show_offline).pack(pady=2)
         ttk.Button(tbtn, text="符文之语检查", width=9, command=self.open_runes).pack(pady=2)
-        self.lbl_theory = ttk.Label(tbtn, text="等待存档…", foreground="#555", justify="center")
+        self.lbl_theory = ttk.Label(tbtn, text="等待存档…", foreground="#555", justify="center",
+                                     wraplength=150)
         self.lbl_theory.pack(pady=4)
         self._last_theory = None
 
@@ -1271,6 +1284,84 @@ class App:
         self.sort_theory = key
         self._fill_theory()
 
+    # ---- 通关校准 / 离线收益（_sim）----
+    @staticmethod
+    def _load_calib():
+        try:
+            return json.load(open(os.path.join(_sim._DIR, "_calib.json"), encoding="utf-8"))
+        except Exception:
+            return {}
+
+    def calibrate_stage(self):
+        if not _sim:
+            return
+        th = self._last_theory
+        rows = (th or {}).get("rows") or []
+        win = tk.Toplevel(self)
+        win.title("通关用时校准")
+        win.geometry("420x200")
+        ttk.Label(win, text="把游戏活动记录的「第X-Y关通关，用时1m56s」填进来，\n"
+                            "所有关卡会按你队伍的真实节奏重算（近的准、远的粗）。").pack(pady=8)
+        bar = ttk.Frame(win)
+        bar.pack(pady=4)
+        ttk.Label(bar, text="关卡").pack(side="left")
+        cb = ttk.Combobox(bar, width=24, state="readonly",
+                          values=[r["map"] for r in rows])
+        cb.pack(side="left", padx=4)
+        if rows:
+            cb.set(rows[0]["map"])
+        ttk.Label(bar, text="用时 秒").pack(side="left")
+        e_t = ttk.Entry(bar, width=7)
+        e_t.pack(side="left", padx=4)
+
+        def apply():
+            try:
+                secs = float(e_t.get())
+            except ValueError:
+                messagebox.showerror("校准", "用时填秒数，如 116 或 95.5")
+                return
+            row = next((r for r in rows if r["map"] == cb.get()), None)
+            if not row or secs <= 0:
+                return
+            old_f = float((self.poller.calib or {}).get("factor") or 1.0)
+            raw = row["t_clear"] / old_f          # 还原未校准模型时间
+            calib = {"factor": round(secs / raw, 4), "mon_l": row["lv"]}
+            self.poller.calib = calib
+            try:
+                json.dump(calib, open(os.path.join(_sim._DIR, "_calib.json"), "w", encoding="utf-8"))
+            except Exception:
+                pass
+            win.destroy()
+            self.log("已校准：%s 用时 %.0f 秒 → 全表 ×%.3f" % (row["map"], secs, calib["factor"]))
+        ttk.Button(win, text="应用", command=apply).pack(pady=8)
+
+    def show_offline(self):
+        if not _sim:
+            return
+        win = tk.Toplevel(self)
+        win.title("离线收益（挂机结算口径：无首领/无宝箱，无人倒下的最近关）")
+        win.geometry("560x360")
+        cols = ("map", "lv", "gold", "xp", "surv")
+        tr = ttk.Treeview(win, columns=cols, show="headings")
+        for cid, txt, w in (("map", "关卡", 150), ("lv", "怪Lv", 50),
+                            ("gold", "金币/时", 100), ("xp", "经验/时", 110),
+                            ("surv", "最坦者存活", 90)):
+            tr.heading(cid, text=txt)
+            tr.column(cid, width=w, anchor="w" if cid == "map" else "e")
+        tr.pack(fill="both", expand=True, padx=8, pady=8)
+        try:
+            heroes, act, stage = _sim.read_save_full()
+            rows = _sim.offline_rows(heroes, list(_sim.STAGES.keys())[max(0, min(act, 9))], stage) or []
+        except Exception as ex:
+            rows = []
+            messagebox.showerror("离线收益", "读取存档失败：%r" % ex)
+        if not rows:
+            tr.insert("", "end", values=("—", "", "当前关以下没有能站住的关（或存档未读到）", "", ""))
+        for r in rows:
+            tr.insert("", "end", values=(r["map"], r["lv"], "%.0f" % r["gold_h"],
+                                         "%.0f" % r["xp_h"], "%.0f秒/波" % r["surv"]))
+        ttk.Label(win, text="离线不给普通宝箱、不给物品；按「无人倒下的最近关」结算（economy.md）。").pack(pady=4)
+
     def open_runes(self):
         """符文之语检查：扫描 装备/背包/仓库 物品插槽数据 + 散宝石，列出可组成/差什么。"""
         rw = getattr(self, "_rw_win", None)
@@ -1332,10 +1423,29 @@ class App:
         key = self.sort_theory
         rows = sorted(th["rows"], key=lambda r: -r[key + "_h"])
         for r in rows[:12]:
-            tag = ("risk",) if r["surv"] < 5 else ()
+            if r["verdict"] == "致命":
+                tag = ("risk",)
+            elif r["verdict"] == "危险":
+                tag = ("warn",)
+            else:
+                tag = ()
             self.thtree.insert("", "end", tags=tag, values=(
-                r["map"], r["lv"], "%.0f" % r["kills_h"], "%.0f" % r["xp_h"],
-                "%.0f" % r["gold_h"], "%.0f击" % r["surv"] if r["surv"] < 99 else "—"))
+                r["map"], r["verdict"], r["lv"], "%.0f" % r["kills_h"], "%.0f" % r["xp_h"],
+                "%.0f" % r["gold_h"], "%.1f" % r["chests_h"],
+                ("%.0f秒" % r["surv"]) if r["surv"] < 99 else "—"))
+        # 推荐位 + 每英雄升级时间
+        lines = []
+        bx, bg = th.get("best_xp"), th.get("best_gold")
+        if bx:
+            lines.append("经验最佳：%s（%.0f/时）" % (bx["map"], bx["xp_h"]))
+        if bg:
+            lines.append("金币最佳：%s（%.0f/时）" % (bg["map"], bg["gold_h"]))
+        if bx and _sim:
+            for i, (cid, lv) in enumerate(th.get("heroes") or []):
+                t = _sim.time_to_level(bx["xp_each"][i], lv)
+                if t:
+                    lines.append("%s Lv%d → %d：%.1f 小时" % (cid, lv, lv + 1, t / 3600.0))
+        self.lbl_theory.config(text="\n".join(lines) if lines else "等待存档…")
 
     def _fill_tree(self):
         rows = sorted(self._last_rows, key=lambda r: -r[self.sort_key])
