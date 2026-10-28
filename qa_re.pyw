@@ -400,6 +400,7 @@ class SavePoller:
         self.hero_xp = 0.0
         self.bestiary = {}
         self.theory = None            # 理论收益（theory_rows 结果，随存档刷新）
+        self.rw_data = ([], {})       # 符文之语（物品清单, 散宝石）
         self.path = ""
         self.mtime = 0.0
         self.stop_evt = threading.Event()
@@ -438,6 +439,22 @@ class SavePoller:
                                "level": int(h.get("level", 0) or 0),
                                "treeNodes": list(h.get("treeNodes") or []),
                                "equipment": h.get("equipment") or {}})
+        rw_items = []
+        for i, h in enumerate(heroes_out):
+            for slot, it in (h["equipment"] or {}).items():
+                if it and isinstance(it, dict):
+                    rw_items.append({"src": "英雄%d·%s" % (i + 1, SLOT_ZH.get(slot, slot)),
+                                     "slot": slot, "rarity": it.get("rarity"),
+                                     "sockets": list(it.get("sockets") or [])})
+        for src, arr in (("背包", sim.get("inventory") or []), ("仓库", sim.get("stash") or [])):
+            for it in arr:
+                if it and isinstance(it, dict):
+                    rw_items.append({"src": src, "slot": it.get("slot") or "?",
+                                     "rarity": it.get("rarity"),
+                                     "sockets": list(it.get("sockets") or [])})
+        rw_gems = dict(sim.get("stashGems") or {})
+        for gid, n in (sim.get("gems") or {}).items():
+            rw_gems[gid] = rw_gems.get(gid, 0) + int(n or 0)
         return dict(
             gold=float(sim.get("gold", 0) or 0),
             xp=float(h0.get("xp", 0) or 0),
@@ -447,7 +464,7 @@ class SavePoller:
             kills=int(sim.get("kills", 0) or 0),
             chests=int(chests.get("normal", 0) or 0),
             bestiary=dict(sim.get("abatesDoBestiario") or {}),
-            heroes=heroes_out,
+            heroes=heroes_out, rw_items=rw_items, rw_gems=rw_gems,
         )
 
     # ---- 主循环 ----
@@ -472,6 +489,7 @@ class SavePoller:
             self.mtime, self.path = m, path
             self.level, self.hero_xp, self.bestiary = s["level"], s["xp"], s["bestiary"]
             self.theory = theory_rows(s["heroes"])
+            self.rw_data = (s["rw_items"], s["rw_gems"])
             prev = self.samples[-1][1] if self.samples else None
             self.samples.append((now, s))
             if self.samples and now - self.samples[0][0] > 1800:
@@ -562,7 +580,7 @@ class SavePoller:
             return dict(xp_m=xp_m, gold_m=gold_m, kill_m=kill_m, eta=eta,
                         level=self.level, hero_xp=self.hero_xp, cur_map=cur_map,
                         rows=rows, session=dict(self.session), dur=sess_dur,
-                        theory=self.theory,
+                        theory=self.theory, rw=self.rw_data,
                         path=self.path, mtime=self.mtime, err=self.err,
                         n_samp=len(self.samples))
 
@@ -573,6 +591,127 @@ RARITY_ZH = {"common": "普通", "uncommon": "优良", "rare": "稀有",
 SLOT_ZH = {"weapon": "武器", "offhand": "副手", "helmet": "头", "armor": "甲",
            "legs": "腿", "boots": "靴", "gloves": "手", "belt": "腰",
            "ring": "戒", "necklace": "链", "earrings": "耳", "bracelet": "镯", "amulet": "护"}
+
+# ---- 符文之语（wiki gems.md · 21 条，规则=槽位+稀有度+宝石种类按顺序）----
+GEM_ALIASES = {"gem_bleed": "bleeding", "gem_pierce": "piercing", "gem_poison": "venomous",
+               "gem_putrid": "putrid", "gem_curse": "cursed", "gem_shock": "voltaic",
+               "gem_freeze": "freezing", "gem_thorns": "thorned", "gem_blind": "blinding",
+               "gem_weaken": "weakening", "gem_burn": "burning", "gem_expose": "revealing",
+               "gem_fury": "raging", "gem_prism": "prismatic"}
+GEM_ZH = {"ruby": "红宝石", "sapphire": "蓝宝石", "diamond": "钻石", "emerald": "翡翠",
+          "amethyst": "紫水晶", "topaz": "黄玉", "garnet": "石榴石", "aquamarine": "海蓝宝",
+          "citrine": "黄水晶", "onyx": "缟玛瑙", "bleeding": "流血石", "piercing": "穿透石",
+          "putrid": "腐烂石", "venomous": "剧毒石", "voltaic": "电压石", "cursed": "诅咒石",
+          "revealing": "揭露石", "freezing": "冰冻石", "weakening": "削弱石", "blinding": "致盲石",
+          "thorned": "荆棘石", "burning": "燃烧石", "prismatic": "棱光石", "raging": "狂怒石"}
+RW_RARITY_ZH = {"common": "普通", "uncommon": "优良", "rare": "稀有", "heroic": "史诗",
+                "mythic": "神话", "ascendant": "传说", "eternal": "永恒"}
+
+def _rw_fits(slots, rars):
+    return dict(slots) if rars is None else {s: rars for s in slots}
+
+RUNEWORDS = [
+    {"en": "Fortune", "zh": "命运", "gems": ("topaz", "topaz"),
+     "fits": {"necklace": {"heroic", "mythic"}, "earrings": {"ascendant", "eternal"}, "bracelet": {"ascendant", "eternal"}},
+     "bonus": "金币获取 +1%→+12%"},
+    {"en": "Frenzy", "zh": "狂乱", "gems": ("amethyst", "ruby"),
+     "fits": _rw_fits(("weapon", "offhand"), {"rare"}), "bonus": "攻速 +0.6%→+7.2%，攻击 +5→+60"},
+    {"en": "Thick Hide", "zh": "厚皮", "gems": ("sapphire", "diamond"),
+     "fits": {"helmet": {"heroic"}, "gloves": {"heroic"}, "boots": {"heroic"}, "armor": {"rare"}, "legs": {"rare"}, "belt": {"heroic", "mythic"}},
+     "bonus": "防御 +6→+72，生命 +400→+4800"},
+    {"en": "Fury", "zh": "狂怒", "gems": ("ruby", "ruby", "amethyst"),
+     "fits": _rw_fits(("weapon", "offhand"), {"heroic"}), "bonus": "攻击 +9→+108，攻速 +0.6%→+7.2%"},
+    {"en": "Aegis", "zh": "神盾", "gems": ("sapphire", "diamond", "sapphire"),
+     "fits": {"helmet": {"mythic", "ascendant"}, "gloves": {"mythic", "ascendant"}, "boots": {"mythic", "ascendant"}, "armor": {"heroic"}, "legs": {"heroic"}, "belt": {"ascendant", "eternal"}},
+     "bonus": "防御 +8→+96，生命 +600→+7200"},
+    {"en": "Hemorrhage", "zh": "出血", "gems": ("bleeding", "bleeding", "piercing"),
+     "fits": _rw_fits(("weapon", "offhand"), {"heroic"}), "bonus": "流血 +7.5→+90，穿透 +0.2%→+2.4%"},
+    {"en": "Plague", "zh": "瘟疫", "gems": ("venomous", "putrid", "cursed"),
+     "fits": _rw_fits(("weapon", "offhand"), {"heroic"}), "bonus": "剧毒 +5→+60，腐烂 +5→+60，诅咒 +0.2%→+2.4%"},
+    {"en": "Storm", "zh": "风暴", "gems": ("citrine", "citrine", "voltaic"),
+     "fits": _rw_fits(("weapon", "offhand"), {"heroic"}), "bonus": "闪电伤害 +6→+72，感电 +0.25%→+3%"},
+    {"en": "Winter", "zh": "凛冬", "gems": ("aquamarine", "aquamarine", "freezing"),
+     "fits": _rw_fits(("weapon", "offhand"), {"heroic"}), "bonus": "冰霜伤害 +6→+72，冰缓 +0.25%→+3%"},
+    {"en": "Void", "zh": "虚空", "gems": ("onyx", "onyx", "putrid"),
+     "fits": _rw_fits(("weapon", "offhand"), {"heroic"}), "bonus": "混沌伤害 +6→+72，腐烂 +6→+72"},
+    {"en": "Thornwall", "zh": "荆墙", "gems": ("sapphire", "thorned", "thorned", "diamond"),
+     "fits": {"helmet": {"eternal"}, "gloves": {"eternal"}, "boots": {"eternal"}, "armor": {"mythic"}, "legs": {"mythic"}},
+     "bonus": "荆棘 +7.5→+90，防御 +6→+72，格挡 +20→+240"},
+    {"en": "Execution", "zh": "处决", "gems": ("emerald", "emerald", "ruby", "piercing"),
+     "fits": _rw_fits(("weapon", "offhand"), {"mythic"}), "bonus": "暴击率 +0.6%→+7.2%，暴击伤害 +1%→+12%"},
+    {"en": "Blaze", "zh": "烈焰", "gems": ("garnet", "garnet", "burning", "burning"),
+     "fits": _rw_fits(("weapon", "offhand"), {"mythic"}), "bonus": "火焰伤害 +7→+84，燃烧 +7→+84"},
+    {"en": "Dark Veil", "zh": "暗幕", "gems": ("blinding", "weakening", "freezing", "diamond"),
+     "fits": {"helmet": {"eternal"}, "gloves": {"eternal"}, "boots": {"eternal"}, "armor": {"mythic"}, "legs": {"mythic"}},
+     "bonus": "削弱 +0.2%→+2.4%，致盲 +0.2%→+2.4%，生命 +300→+3600"},
+    {"en": "Ruin", "zh": "毁灭", "gems": ("cursed", "revealing", "putrid", "onyx", "prismatic"),
+     "fits": _rw_fits(("weapon", "offhand"), {"ascendant"}), "bonus": "混沌伤害 +7→+84，诅咒 +0.3%→+3.6%，破甲 +0.2%→+2.4%"},
+    {"en": "Avalanche", "zh": "雪崩", "gems": ("aquamarine", "aquamarine", "aquamarine", "freezing", "prismatic"),
+     "fits": _rw_fits(("weapon", "offhand"), {"ascendant"}), "bonus": "冰霜伤害 +8→+96，冰缓 +0.35%→+4.2%，元素穿透 +0.25%→+3%"},
+    {"en": "Thunderstrike", "zh": "雷击", "gems": ("citrine", "citrine", "citrine", "voltaic", "prismatic"),
+     "fits": _rw_fits(("weapon", "offhand"), {"ascendant"}), "bonus": "闪电伤害 +8→+96，感电 +0.35%→+4.2%，元素穿透 +0.25%→+3%"},
+    {"en": "Wildfire", "zh": "燎原", "gems": ("garnet", "garnet", "garnet", "burning", "prismatic"),
+     "fits": _rw_fits(("weapon", "offhand"), {"ascendant"}), "bonus": "火焰伤害 +8→+96，燃烧 +9→+108，元素穿透 +0.25%→+3%"},
+    {"en": "Doomsday", "zh": "末日", "gems": ("garnet", "citrine", "aquamarine", "onyx", "prismatic", "revealing"),
+     "fits": _rw_fits(("weapon", "offhand"), {"eternal"}), "bonus": "元素伤害 +10→+120，元素穿透 +0.35%→+4.2%，破甲 +0.25%→+3%"},
+    {"en": "Warheart", "zh": "战心", "gems": ("ruby", "ruby", "emerald", "amethyst", "piercing", "bleeding"),
+     "fits": _rw_fits(("weapon", "offhand"), {"eternal"}), "bonus": "攻击 +10→+120，暴击率 +0.5%→+6%，流血 +6→+72，攻速 +0.5%→+6%"},
+    {"en": "Eternal Bulwark", "zh": "永恒壁垒", "gems": ("sapphire", "diamond", "sapphire", "diamond", "thorned", "blinding"),
+     "fits": _rw_fits(("armor", "legs"), {"eternal"}), "bonus": "防御 +10→+120，生命 +750→+9000，格挡 +30→+360，荆棘 +6→+72"},
+]
+
+def _gem_kind(gid):
+    if not isinstance(gid, str) or not gid:
+        return ""
+    base = re.sub(r"_t\d+$", "", gid)
+    return GEM_ALIASES.get(base, base)
+
+def _gem_tier(gid):
+    m = re.search(r"_t(\d+)$", gid or "")
+    return int(m.group(1)) if m else 1
+
+def _rw_need_txt(cnt):
+    return "、".join("%s×%d" % (GEM_ZH.get(k, k), n) for k, n in cnt.items()) or "—"
+
+def runeword_report(items, loose):
+    """items=[{src,slot,rarity,sockets}] loose={gem_id:n} → (rows, loose Counter)
+    rows: 已激活 > 可激活 > 缺宝石；只列「槽位/稀有度/孔数」匹配且已镶部分构成前缀的组合。"""
+    lk = {}
+    for gid, n in (loose or {}).items():
+        k = _gem_kind(gid)
+        if k:
+            lk[k] = lk.get(k, 0) + int(n or 0)
+    rows = []
+    for it in items or []:
+        socks = it.get("sockets") or []
+        cur = [_gem_kind(s) for s in socks if isinstance(s, str) and s]
+        if len(socks) == 0:
+            continue
+        for rw in RUNEWORDS:
+            rars = rw["fits"].get(it.get("slot"))
+            if not rars or it.get("rarity") not in rars or len(rw["gems"]) != len(socks):
+                continue
+            need = list(rw["gems"])
+            if cur != need[:len(cur)]:
+                continue
+            missing = need[len(cur):]
+            mc = {}
+            for k in missing:
+                mc[k] = mc.get(k, 0) + 1
+            if missing:
+                short = any(n > lk.get(k, 0) for k, n in mc.items())
+                status = "可激活" if not short else "缺宝石"
+                tag = "ok" if not short else "lack"
+            else:
+                status, tag = "已激活", "done"
+            rows.append({"src": it.get("src") or "?",
+                         "item": "%s·%s" % (SLOT_ZH.get(it.get("slot"), it.get("slot") or "?"),
+                                            RW_RARITY_ZH.get(it.get("rarity"), it.get("rarity") or "?")),
+                         "rw": "%s（%s）" % (rw["en"], rw["zh"]),
+                         "status": status, "need": _rw_need_txt(mc), "bonus": rw["bonus"], "tag": tag})
+    order = {"done": 0, "ok": 1, "lack": 2}
+    rows.sort(key=lambda r: order.get(r["tag"], 9))
+    return rows, lk
 MARKET_API = "https://api.artxgames.com/questaway/market/listings?ordem=novos&porPagina=54&pagina={page}"
 MARKET_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
              "Chrome/156.0.0.0 Safari/537.36 Edg/156.0.0.0")
@@ -906,6 +1045,7 @@ class App:
         self.sort_theory = "xp"
         ttk.Button(tbtn, text="按经验排", width=9, command=lambda: self._sort_theory("xp")).pack(pady=2)
         ttk.Button(tbtn, text="按金币排", width=9, command=lambda: self._sort_theory("gold")).pack(pady=2)
+        ttk.Button(tbtn, text="符文之语检查", width=9, command=self.open_runes).pack(pady=2)
         self.lbl_theory = ttk.Label(tbtn, text="等待存档…", foreground="#555", justify="center")
         self.lbl_theory.pack(pady=4)
         self._last_theory = None
@@ -1130,6 +1270,59 @@ class App:
     def _sort_theory(self, key):
         self.sort_theory = key
         self._fill_theory()
+
+    def open_runes(self):
+        """符文之语检查：扫描 装备/背包/仓库 物品插槽数据 + 散宝石，列出可组成/差什么。"""
+        rw = getattr(self, "_rw_win", None)
+        if rw is not None and rw.winfo_exists():
+            rw.lift()
+            return
+        win = tk.Toplevel(self)
+        self._rw_win = win
+        win.title("符文之语检查（装备 / 背包 / 仓库）")
+        win.geometry("980x560")
+        pad = dict(padx=8, pady=4)
+
+        lbl_loose = ttk.Label(win, text="读取存档中…", foreground="#333", justify="left",
+                              wraplength=940)
+        lbl_loose.pack(fill="x", **pad)
+
+        cols = ("src", "item", "rw", "status", "need", "bonus")
+        tr = ttk.Treeview(win, columns=cols, show="headings")
+        for cid, txt, w, anc in (("src", "位置", 92, "w"), ("item", "物品", 84, "w"),
+                                 ("rw", "符文之语", 160, "w"), ("status", "状态", 64, "center"),
+                                 ("need", "镶嵌需求（按孔顺序）", 250, "w"),
+                                 ("bonus", "加成（T1→T5 全档宝石）", 300, "w")):
+            tr.heading(cid, text=txt)
+            tr.column(cid, width=w, anchor=anc)
+        tr.pack(fill="both", expand=True, padx=8, pady=4)
+        tr.tag_configure("done", background="#d8f5d8")
+        tr.tag_configure("ok", background="#fff3c4")
+        tr.tag_configure("lack", background="")
+
+        def refresh():
+            tr.delete(*tr.get_children())
+            try:
+                items, loose = self.poller.snapshot().get("rw") or ([], {})
+            except Exception:
+                items, loose = [], {}
+            rows, lk = runeword_report(items, loose)
+            loose_txt = "、".join("%s×%d" % (GEM_ZH.get(k, k), n)
+                                  for k, n in sorted(lk.items(), key=lambda x: -x[1]))
+            lbl_loose.config(text="散宝石（背包+仓库合计）：" + (loose_txt or "无")
+                             + "    |    可激活=散宝石足够补齐空孔；镶嵌顺序必须与需求列一致")
+            if not rows:
+                tr.insert("", "end", values=("—", "—", "未读到可分析的物品（先开一次游戏让存档写盘）", "", "", ""))
+                return
+            for r in rows:
+                tr.insert("", "end", tags=(r["tag"],),
+                          values=(r["src"], r["item"], r["rw"], r["status"], r["need"], r["bonus"]))
+
+        bar = ttk.Frame(win)
+        bar.pack(fill="x", **pad)
+        ttk.Button(bar, text="刷新", command=refresh).pack(side="left")
+        ttk.Label(bar, text="绿=已激活  黄=散宝石够直接补齐  白=还缺宝石", foreground="#555").pack(side="left", padx=10)
+        refresh()
 
     def _fill_theory(self):
         th = self._last_theory
