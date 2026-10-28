@@ -1,0 +1,6 @@
+build/
+dist/
+__pycache__/
+_capture/
+_token.txt
+*.log
